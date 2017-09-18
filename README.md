@@ -39,3 +39,14 @@ These fonts, however, are known to work:
 * [Operator Mono](https://www.typography.com/fonts/operator/overview/)
 * [Ubuntu Mono](http://font.ubuntu.com/)
 
+## Apply the patch
+
+To apply the patch, get the source code [for the right version of PuTTY](https://www.chiark.greenend.org.uk/~sgtatham/putty/releases/0.70.html).
+Place the patch file within reach, and run something to the effect of:
+
+```sh
+patch -p1 < italics-0.70.patch
+```
+
+Then, build PuTTY as normal.  You'll need to build the Makefiles/project files
+with `mkfiles.pl` and finally build.
