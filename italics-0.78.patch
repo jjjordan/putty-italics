@@ -1,0 +1,203 @@
+diff -bruN putty-0.78.orig/putty.h putty-0.78/putty.h
+--- putty-0.78.orig/putty.h	2023-02-13 15:02:11.997278200 -0600
++++ putty-0.78/putty.h	2023-02-13 14:54:52.092279400 -0600
+@@ -241,6 +241,7 @@
+  */
+ #define UCSWIDE      0xDFFF
+ 
++#define ATTR_ITALIC  0x1000000U
+ #define ATTR_NARROW  0x0800000U
+ #define ATTR_WIDE    0x0400000U
+ #define ATTR_BOLD    0x0040000U
+diff -bruN putty-0.78.orig/terminal/terminal.c putty-0.78/terminal/terminal.c
+--- putty-0.78.orig/terminal/terminal.c	2023-02-13 15:02:12.062745900 -0600
++++ putty-0.78/terminal/terminal.c	2023-02-13 14:55:33.115000800 -0600
+@@ -4525,6 +4525,10 @@
+                             compatibility(OTHER);
+                             term->curr_attr |= ATTR_DIM;
+                             break;
++						  case 3:		/* enable italics */
++							compatibility(ANSI);
++							term->curr_attr |= ATTR_ITALIC;
++							break;
+                           case 21:      /* (enable double underline) */
+                             compatibility(OTHER);
+                           case 4:       /* enable underline */
+@@ -4563,6 +4567,10 @@
+                             compatibility2(OTHER, VT220);
+                             term->curr_attr &= ~(ATTR_BOLD | ATTR_DIM);
+                             break;
++                          case 23:      /* disable italics */
++                            compatibility(ANSI);
++							term->curr_attr &= ~ATTR_ITALIC;
++							break;
+                           case 24:      /* disable underline */
+                             compatibility2(OTHER, VT220);
+                             term->curr_attr &= ~ATTR_UNDER;
+diff -bruN putty-0.78.orig/windows/window.c putty-0.78/windows/window.c
+--- putty-0.78.orig/windows/window.c	2023-02-13 15:02:12.112986600 -0600
++++ putty-0.78/windows/window.c	2023-02-13 14:55:42.401860100 -0600
+@@ -165,17 +165,18 @@
+ #define FONT_BOLD 1
+ #define FONT_UNDERLINE 2
+ #define FONT_BOLDUND 3
+-#define FONT_WIDE       0x04
+-#define FONT_HIGH       0x08
+-#define FONT_NARROW     0x10
+-
+-#define FONT_OEM        0x20
+-#define FONT_OEMBOLD    0x21
+-#define FONT_OEMUND     0x22
+-#define FONT_OEMBOLDUND 0x23
++#define FONT_ITALIC 4
++#define FONT_WIDE       0x08
++#define FONT_HIGH       0x10
++#define FONT_NARROW     0x20
++
++#define FONT_OEM        0x40
++#define FONT_OEMBOLD    0x41
++#define FONT_OEMUND     0x42
++#define FONT_OEMBOLDUND 0x43
+ 
+-#define FONT_MAXNO      0x40
+-#define FONT_SHIFT      5
++#define FONT_MAXNO      0x4F
++#define FONT_SHIFT      6
+ static HFONT fonts[FONT_MAXNO];
+ static LOGFONT lfont;
+ static bool fontflag[FONT_MAXNO];
+@@ -187,6 +188,7 @@
+     UND_LINE, UND_FONT
+ } und_mode;
+ static int descent, font_strikethrough_y;
++static int use_italics;
+ 
+ static COLORREF colours[OSC4_NCOLOURS];
+ static HPALETTE pal;
+@@ -1450,13 +1452,13 @@
+     font_width = pick_width;
+ 
+     quality = conf_get_int(conf, CONF_font_quality);
+-#define f(i,c,w,u) \
+-    fonts[i] = CreateFont (font_height, font_width, 0, 0, w, false, u, false, \
++#define f(i,c,w,u,t) \
++    fonts[i] = CreateFont (font_height, font_width, 0, 0, w, t, u, false, \
+                            c, OUT_DEFAULT_PRECIS, \
+                            CLIP_DEFAULT_PRECIS, FONT_QUALITY(quality), \
+                            FIXED_PITCH | FF_DONTCARE, font->name)
+ 
+-    f(FONT_NORMAL, font->charset, fw_dontcare, false);
++    f(FONT_NORMAL, font->charset, fw_dontcare, false, false);
+ 
+     SelectObject(hdc, fonts[FONT_NORMAL]);
+     GetTextMetrics(hdc, &tm);
+@@ -1503,7 +1505,57 @@
+         ucsdata.dbcs_screenfont = (cpinfo.MaxCharSize > 1);
+     }
+ 
+-    f(FONT_UNDERLINE, font->charset, fw_dontcare, true);
++    /* Check whether italic face is acceptable... */
++    f(FONT_ITALIC, font->charset, fw_dontcare, FALSE, TRUE);
++
++    {
++        LPOUTLINETEXTMETRICA regularOtm, italicOtm;
++
++        use_italics = 0;
++
++        i = GetOutlineTextMetricsA(hdc, 0, NULL);
++        if (i > 0) {
++            regularOtm = (LPOUTLINETEXTMETRICA)safemalloc(1, i, 0);
++            regularOtm->otmSize = sizeof(OUTLINETEXTMETRICA);
++            if (GetOutlineTextMetricsA(hdc, i, regularOtm)) {
++                /* Now get the italic version */
++                SelectObject(hdc, fonts[FONT_ITALIC]);
++                i = GetOutlineTextMetricsA(hdc, 0, NULL);
++                if (i > 0) {
++                    italicOtm = (LPOUTLINETEXTMETRICA)safemalloc(1, i, 0);
++                    italicOtm->otmSize = sizeof(OUTLINETEXTMETRICA);
++                    if (GetOutlineTextMetricsA(hdc, i, italicOtm)) {
++                        /* Compare... */
++                        char *regStyle = (char*)regularOtm + (int)regularOtm->otmpStyleName;
++                        char *itaStyle = (char*)italicOtm + (int)italicOtm->otmpStyleName;
++
++                        /* Weed out "italic" fonts that...
++                           - Do not specify an italic slant (probably just the regular font)
++                           - Have the same style as the regular font.  Then it *is* just the regular
++                           font with a linear transformation.
++                           - Report the style name of "Oblique".
++
++                           My experience is these a) don't look very good b) tend to overhang the
++                           next character and get cut off during paints... which doesn't look very good. */
++                        if (strcmp(regStyle, itaStyle) && stricmp(itaStyle, "Oblique") && italicOtm->otmItalicAngle != 0) {
++                            use_italics = 1;
++                        }
++                    }
++
++                    safefree(italicOtm);
++                }
++            }
++
++            safefree(regularOtm);
++        }
++
++        if (!use_italics) {
++            DeleteObject(fonts[FONT_ITALIC]);
++            fonts[FONT_ITALIC] = NULL;
++        }
++    }
++
++    f(FONT_UNDERLINE, font->charset, fw_dontcare, TRUE, FALSE);
+ 
+     /*
+      * Some fonts, e.g. 9-pt Courier, draw their underlines
+@@ -1555,7 +1607,7 @@
+     }
+ 
+     if (bold_font_mode == BOLD_FONT) {
+-        f(FONT_BOLD, font->charset, fw_bold, false);
++        f(FONT_BOLD, font->charset, fw_bold, false, false);
+     }
+ #undef f
+ 
+@@ -1605,7 +1657,7 @@
+ {
+     int basefont;
+     int fw_dontcare, fw_bold, quality;
+-    int c, w, x;
++    int c, w, x, t;
+     bool u;
+     char *s;
+     FontSpec *font;
+@@ -1632,6 +1684,7 @@
+     u = false;
+     s = font->name;
+     x = font_width;
++	t = false;
+ 
+     if (fontno & FONT_WIDE)
+         x *= 2;
+@@ -1643,12 +1696,14 @@
+         w = fw_bold;
+     if (fontno & FONT_UNDERLINE)
+         u = true;
++    if (fontno & FONT_ITALIC && use_italics)
++        t = TRUE;
+ 
+     quality = conf_get_int(conf, CONF_font_quality);
+ 
+     fonts[fontno] =
+         CreateFont(font_height * (1 + !!(fontno & FONT_HIGH)), x, 0, 0, w,
+-                   false, u, false, c, OUT_DEFAULT_PRECIS,
++                   t, u, false, c, OUT_DEFAULT_PRECIS,
+                    CLIP_DEFAULT_PRECIS, FONT_QUALITY(quality),
+                    DEFAULT_PITCH | FF_DONTCARE, s);
+ 
+@@ -3640,6 +3695,8 @@
+         nfont |= FONT_BOLD;
+     if (und_mode == UND_FONT && (attr & ATTR_UNDER))
+         nfont |= FONT_UNDERLINE;
++	if (attr & ATTR_ITALIC)
++		nfont |= FONT_ITALIC;
+     another_font(nfont);
+     if (!fonts[nfont]) {
+         if (nfont & FONT_UNDERLINE)
