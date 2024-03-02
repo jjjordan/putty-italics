@@ -1,0 +1,216 @@
+diff --git a/putty.h b/putty.h
+index 6c5ed992..224beffc 100644
+--- a/putty.h
++++ b/putty.h
+@@ -241,6 +241,7 @@ extern const int colour_indices_oscp_to_osc4[OSCP_NCOLOURS];
+  */
+ #define UCSWIDE      0xDFFF
+ 
++#define ATTR_ITALIC  0x1000000U
+ #define ATTR_NARROW  0x0800000U
+ #define ATTR_WIDE    0x0400000U
+ #define ATTR_BOLD    0x0040000U
+diff --git a/terminal/terminal.c b/terminal/terminal.c
+index c5af4dc6..ac8d6556 100644
+--- a/terminal/terminal.c
++++ b/terminal/terminal.c
+@@ -1767,7 +1767,7 @@ void term_reconfig(Terminal *term, Conf *conf)
+                     conf_get_int_int(conf, CONF_colours, i*3+j))
+                     break;
+             if (j < 3) {
+-                /* Actually enacting the change has to be deferred 
++                /* Actually enacting the change has to be deferred
+                  * until the new conf is installed. */
+                 palette_changed = true;
+                 break;
+@@ -4631,6 +4631,10 @@ static void term_out(Terminal *term, bool called_from_term_data)
+                             compatibility(OTHER);
+                             term->curr_attr |= ATTR_DIM;
+                             break;
++                          case 3:       /* enable italics */
++                            compatibility(ANSI);
++                            term->curr_attr |= ATTR_ITALIC;
++                            break;
+                           case 21:      /* (enable double underline) */
+                             compatibility(OTHER);
+                           case 4:       /* enable underline */
+@@ -4669,6 +4673,10 @@ static void term_out(Terminal *term, bool called_from_term_data)
+                             compatibility2(OTHER, VT220);
+                             term->curr_attr &= ~(ATTR_BOLD | ATTR_DIM);
+                             break;
++                          case 23:      /* disable italics */
++                            compatibility(ANSI);
++                            term->curr_attr &= ~ATTR_ITALIC;
++                            break;
+                           case 24:      /* disable underline */
+                             compatibility2(OTHER, VT220);
+                             term->curr_attr &= ~ATTR_UNDER;
+diff --git a/windows/window.c b/windows/window.c
+index 83600add..b8e0058b 100644
+--- a/windows/window.c
++++ b/windows/window.c
+@@ -168,17 +168,18 @@ static struct sesslist sesslist;       /* for saved-session menu */
+ #define FONT_BOLD 1
+ #define FONT_UNDERLINE 2
+ #define FONT_BOLDUND 3
+-#define FONT_WIDE       0x04
+-#define FONT_HIGH       0x08
+-#define FONT_NARROW     0x10
+-
+-#define FONT_OEM        0x20
+-#define FONT_OEMBOLD    0x21
+-#define FONT_OEMUND     0x22
+-#define FONT_OEMBOLDUND 0x23
+-
+-#define FONT_MAXNO      0x40
+-#define FONT_SHIFT      5
++#define FONT_ITALIC 4
++#define FONT_WIDE       0x08
++#define FONT_HIGH       0x10
++#define FONT_NARROW     0x20
++
++#define FONT_OEM        0x40
++#define FONT_OEMBOLD    0x41
++#define FONT_OEMUND     0x42
++#define FONT_OEMBOLDUND 0x43
++
++#define FONT_MAXNO      0x4F
++#define FONT_SHIFT      6
+ static HFONT fonts[FONT_MAXNO];
+ static LOGFONT lfont;
+ static bool fontflag[FONT_MAXNO];
+@@ -190,6 +191,7 @@ static enum {
+     UND_LINE, UND_FONT
+ } und_mode;
+ static int descent, font_strikethrough_y;
++static int use_italics;
+ 
+ static COLORREF colours[OSC4_NCOLOURS];
+ static HPALETTE pal;
+@@ -1453,13 +1455,13 @@ static void init_fonts(int pick_width, int pick_height)
+     font_width = pick_width;
+ 
+     quality = conf_get_int(conf, CONF_font_quality);
+-#define f(i,c,w,u) \
+-    fonts[i] = CreateFont (font_height, font_width, 0, 0, w, false, u, false, \
++#define f(i,c,w,u,t) \
++    fonts[i] = CreateFont (font_height, font_width, 0, 0, w, t, u, false, \
+                            c, OUT_DEFAULT_PRECIS, \
+                            CLIP_DEFAULT_PRECIS, FONT_QUALITY(quality), \
+                            FIXED_PITCH | FF_DONTCARE, font->name)
+ 
+-    f(FONT_NORMAL, font->charset, fw_dontcare, false);
++    f(FONT_NORMAL, font->charset, fw_dontcare, false, false);
+ 
+     SelectObject(hdc, fonts[FONT_NORMAL]);
+     GetTextMetrics(hdc, &tm);
+@@ -1506,7 +1508,57 @@ static void init_fonts(int pick_width, int pick_height)
+         ucsdata.dbcs_screenfont = (cpinfo.MaxCharSize > 1);
+     }
+ 
+-    f(FONT_UNDERLINE, font->charset, fw_dontcare, true);
++    /* Check whether italic face is acceptable... */
++    f(FONT_ITALIC, font->charset, fw_dontcare, FALSE, TRUE);
++
++    {
++        LPOUTLINETEXTMETRICA regularOtm, italicOtm;
++
++        use_italics = 0;
++
++        i = GetOutlineTextMetricsA(hdc, 0, NULL);
++        if (i > 0) {
++            regularOtm = (LPOUTLINETEXTMETRICA)safemalloc(1, i, 0);
++            regularOtm->otmSize = sizeof(OUTLINETEXTMETRICA);
++            if (GetOutlineTextMetricsA(hdc, i, regularOtm)) {
++                /* Now get the italic version */
++                SelectObject(hdc, fonts[FONT_ITALIC]);
++                i = GetOutlineTextMetricsA(hdc, 0, NULL);
++                if (i > 0) {
++                    italicOtm = (LPOUTLINETEXTMETRICA)safemalloc(1, i, 0);
++                    italicOtm->otmSize = sizeof(OUTLINETEXTMETRICA);
++                    if (GetOutlineTextMetricsA(hdc, i, italicOtm)) {
++                        /* Compare... */
++                        char *regStyle = (char*)regularOtm + (int)regularOtm->otmpStyleName;
++                        char *itaStyle = (char*)italicOtm + (int)italicOtm->otmpStyleName;
++
++                        /* Weed out "italic" fonts that...
++                           - Do not specify an italic slant (probably just the regular font)
++                           - Have the same style as the regular font.  Then it *is* just the regular
++                           font with a linear transformation.
++                           - Report the style name of "Oblique".
++
++                           My experience is these a) don't look very good b) tend to overhang the
++                           next character and get cut off during paints... which doesn't look very good. */
++                        if (strcmp(regStyle, itaStyle) && stricmp(itaStyle, "Oblique") && italicOtm->otmItalicAngle != 0) {
++                            use_italics = 1;
++                        }
++                    }
++
++                    safefree(italicOtm);
++                }
++            }
++
++            safefree(regularOtm);
++        }
++
++        if (!use_italics) {
++            DeleteObject(fonts[FONT_ITALIC]);
++            fonts[FONT_ITALIC] = NULL;
++        }
++    }
++
++    f(FONT_UNDERLINE, font->charset, fw_dontcare, TRUE, FALSE);
+ 
+     /*
+      * Some fonts, e.g. 9-pt Courier, draw their underlines
+@@ -1558,7 +1610,7 @@ static void init_fonts(int pick_width, int pick_height)
+     }
+ 
+     if (bold_font_mode == BOLD_FONT) {
+-        f(FONT_BOLD, font->charset, fw_bold, false);
++        f(FONT_BOLD, font->charset, fw_bold, false, false);
+     }
+ #undef f
+ 
+@@ -1608,7 +1660,7 @@ static void another_font(int fontno)
+ {
+     int basefont;
+     int fw_dontcare, fw_bold, quality;
+-    int c, w, x;
++    int c, w, x, t;
+     bool u;
+     char *s;
+     FontSpec *font;
+@@ -1635,6 +1687,7 @@ static void another_font(int fontno)
+     u = false;
+     s = font->name;
+     x = font_width;
++    t = false;
+ 
+     if (fontno & FONT_WIDE)
+         x *= 2;
+@@ -1646,12 +1699,14 @@ static void another_font(int fontno)
+         w = fw_bold;
+     if (fontno & FONT_UNDERLINE)
+         u = true;
++    if (fontno & FONT_ITALIC && use_italics)
++        t = TRUE;
+ 
+     quality = conf_get_int(conf, CONF_font_quality);
+ 
+     fonts[fontno] =
+         CreateFont(font_height * (1 + !!(fontno & FONT_HIGH)), x, 0, 0, w,
+-                   false, u, false, c, OUT_DEFAULT_PRECIS,
++                   t, u, false, c, OUT_DEFAULT_PRECIS,
+                    CLIP_DEFAULT_PRECIS, FONT_QUALITY(quality),
+                    DEFAULT_PITCH | FF_DONTCARE, s);
+ 
+@@ -3655,6 +3710,8 @@ static void do_text_internal(
+         nfont |= FONT_BOLD;
+     if (und_mode == UND_FONT && (attr & ATTR_UNDER))
+         nfont |= FONT_UNDERLINE;
++    if (attr & ATTR_ITALIC)
++        nfont |= FONT_ITALIC;
+     another_font(nfont);
+     if (!fonts[nfont]) {
+         if (nfont & FONT_UNDERLINE)
